@@ -229,13 +229,16 @@ impl App {
                 if !p.cmdline.is_empty() { e.cmdline = p.cmdline.clone(); }
                 e.last_seen  = now;
             }
-            // If eBPF is not active, fall back to per-process totals with no remote breakdown.
+            // No eBPF ip_traffic — process has connections but no byte accounting.
+            // /proc/PID/io counts disk I/O, not network bytes, so we don't use it.
+            // We still record the process so it appears in the history table;
+            // byte totals remain 0 until eBPF is enabled.
             if p.ip_traffic.is_empty() {
-                let key = (p.pid, String::new(), 0u16);
+                let key = (p.pid, String::from("(no eBPF)"), 0u16);
                 let e = self.proc_history.entry(key).or_insert_with(|| HistoryEntry {
                     pid:         p.pid,
                     name:        p.name.clone(),
-                    remote_addr: String::new(),
+                    remote_addr: String::from("(no eBPF)"),
                     remote_port: 0,
                     rx_total:    0,
                     tx_total:    0,
@@ -247,10 +250,9 @@ impl App {
                     cmdline:     p.cmdline.clone(),
                     last_seen:   now,
                 });
-                e.rx_total   = e.rx_total.max(p.rx_bytes);
-                e.tx_total   = e.tx_total.max(p.tx_bytes);
-                e.rx_delta   = p.rx_bytes_delta;
-                e.tx_delta   = p.tx_bytes_delta;
+                // Never increment rx_total/tx_total — we have no reliable source.
+                e.rx_delta   = 0;
+                e.tx_delta   = 0;
                 e.connections = p.connections;
                 e.cpu_pct    = p.cpu_pct;
                 e.mem_bytes  = p.mem_bytes;

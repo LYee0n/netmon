@@ -117,6 +117,8 @@ pub struct Collector {
     uid_cache: HashMap<u32, Option<String>>,
     /// Live eBPF traffic table — `None` when eBPF is unavailable.
     pub ebpf_table: Option<EbpfTrafficTable>,
+    /// PIDs that had connections last tick — one-tick grace window for short-lived processes.
+    prev_conn_pids: std::collections::HashSet<u32>,
 }
 
 impl Collector {
@@ -130,6 +132,7 @@ impl Collector {
             prev_proc_io: HashMap::new(),
             uid_cache: HashMap::new(),
             ebpf_table: None,
+            prev_conn_pids: std::collections::HashSet::new(),
         }
     }
 
@@ -293,13 +296,22 @@ impl Collector {
             .map(|t| t.snapshot().iter().map(|e| e.pid).collect())
             .unwrap_or_default();
 
+        // Keep a one-tick grace window: remember PIDs that had connections last
+        // tick so short-lived processes (curl, wget) survive at least one render.
+        let current_pids_with_conns: std::collections::HashSet<u32> =
+            pid_conn_count.keys().cloned().collect();
+        let visible_pids: std::collections::HashSet<u32> = current_pids_with_conns
+            .union(&self.prev_conn_pids)
+            .cloned()
+            .chain(ebpf_pids.iter().cloned())
+            .collect();
+        self.prev_conn_pids = pid_conn_count.keys().cloned().collect();
+
         let mut procs: Vec<ProcTraffic> = Vec::new();
         for (pid_u, proc) in self.sys.processes() {
             let pid = pid_u.as_u32();
             let conn_count = *pid_conn_count.get(&pid).unwrap_or(&0);
-            // Include process if it has active connections OR eBPF has seen
-            // traffic for it (lifetime totals may still be non-zero).
-            if conn_count == 0 && !ebpf_pids.contains(&pid) {
+            if !visible_pids.contains(&pid) {
                 continue;
             }
 
