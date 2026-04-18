@@ -285,11 +285,21 @@ impl Collector {
             }
         }
 
+        // PIDs tracked by eBPF (may have finished their connections but still
+        // have lifetime bytes worth showing).
+        let ebpf_pids: std::collections::HashSet<u32> = self
+            .ebpf_table
+            .as_ref()
+            .map(|t| t.snapshot().iter().map(|e| e.pid).collect())
+            .unwrap_or_default();
+
         let mut procs: Vec<ProcTraffic> = Vec::new();
         for (pid_u, proc) in self.sys.processes() {
             let pid = pid_u.as_u32();
             let conn_count = *pid_conn_count.get(&pid).unwrap_or(&0);
-            if conn_count == 0 {
+            // Include process if it has active connections OR eBPF has seen
+            // traffic for it (lifetime totals may still be non-zero).
+            if conn_count == 0 && !ebpf_pids.contains(&pid) {
                 continue;
             }
 

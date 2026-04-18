@@ -78,6 +78,13 @@ struct TrafficTableInner {
     entries: HashMap<(u32, IpAddr, u16), EbpfTrafficEntry>,
     prev_rx:  HashMap<(u32, IpAddr, u16), u64>,
     prev_tx:  HashMap<(u32, IpAddr, u16), u64>,
+    /// Monotonically-increasing totals since netmon started.
+    /// Never reset — surviving eviction and eBPF map resets.
+    lifetime_rx: HashMap<(u32, IpAddr, u16), u64>,
+    lifetime_tx: HashMap<(u32, IpAddr, u16), u64>,
+    /// Last kernel-map value seen per key, used to detect eBPF-side resets.
+    last_kernel_rx: HashMap<(u32, IpAddr, u16), u64>,
+    last_kernel_tx: HashMap<(u32, IpAddr, u16), u64>,
 }
 
 impl EbpfTrafficTable {
@@ -100,9 +107,15 @@ impl EbpfTrafficTable {
             inner.prev_rx.insert(k, rx);
             inner.prev_tx.insert(k, tx);
 
+            // Read lifetime totals into locals before the mutable entries borrow.
+            let life_rx = *inner.lifetime_rx.get(&k).unwrap_or(&rx);
+            let life_tx = *inner.lifetime_tx.get(&k).unwrap_or(&tx);
             if let Some(entry) = inner.entries.get_mut(&k) {
                 entry.rx_delta = rx.saturating_sub(prev_rx);
                 entry.tx_delta = tx.saturating_sub(prev_tx);
+                // Report lifetime totals so the display is always cumulative.
+                entry.rx_bytes = life_rx;
+                entry.tx_bytes = life_tx;
                 out.push(entry.clone());
             }
         }
@@ -117,6 +130,18 @@ impl EbpfTrafficTable {
         let remote_addr = key.remote_addr();
         let mk = (key.pid, remote_addr, key.remote_port);
         let mut inner = self.inner.lock().unwrap();
+        // Do all lifetime bookkeeping before borrowing `entries` mutably.
+        // Accumulate lifetime totals. If the kernel counter went backward
+        // (eBPF reload / overflow) treat it as a fresh start from 0.
+        let last_krx = *inner.last_kernel_rx.get(&mk).unwrap_or(&0);
+        let last_ktx = *inner.last_kernel_tx.get(&mk).unwrap_or(&0);
+        let krx_inc = val.rx_bytes.saturating_sub(last_krx);
+        let ktx_inc = val.tx_bytes.saturating_sub(last_ktx);
+        inner.last_kernel_rx.insert(mk, val.rx_bytes);
+        inner.last_kernel_tx.insert(mk, val.tx_bytes);
+        *inner.lifetime_rx.entry(mk).or_insert(0) += krx_inc;
+        *inner.lifetime_tx.entry(mk).or_insert(0) += ktx_inc;
+        // Now safe to mutably borrow entries.
         let entry = inner.entries.entry(mk).or_insert_with(|| {
             EbpfTrafficEntry::new(
                 key.pid,
@@ -139,14 +164,21 @@ impl EbpfTrafficTable {
             IpAddr::V6(Ipv6Addr::from(ev.dst_ip6))
         };
         let mk = (ev.pid, remote_addr, ev.dst_port);
+        let inc = ev.bytes as u64;
         let mut inner = self.inner.lock().unwrap();
+        // Update lifetime accumulators before borrowing entries mutably.
+        if ev.direction == 1 {
+            *inner.lifetime_tx.entry(mk).or_insert(0) += inc;
+        } else {
+            *inner.lifetime_rx.entry(mk).or_insert(0) += inc;
+        }
         let entry = inner.entries.entry(mk).or_insert_with(|| {
             EbpfTrafficEntry::new(ev.pid, String::new(), remote_addr, ev.dst_port)
         });
         if ev.direction == 1 {
-            entry.tx_bytes += ev.bytes as u64;
+            entry.tx_bytes += inc;
         } else {
-            entry.rx_bytes += ev.bytes as u64;
+            entry.rx_bytes += inc;
         }
         entry.last_seen = Instant::now();
     }
@@ -154,6 +186,8 @@ impl EbpfTrafficTable {
     fn evict_stale(&self, ttl: Duration) {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
+        // Only evict from the live entries table — lifetime_rx/tx are kept
+        // forever so cumulative totals survive process death and quietness.
         inner.entries.retain(|_, v| now.duration_since(v.last_seen) < ttl);
     }
 }
