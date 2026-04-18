@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::{
     io,
     time::{Duration, Instant},
@@ -123,6 +124,25 @@ impl Sort {
 
 // ─── app ─────────────────────────────────────────────────────────────────────
 
+/// One row in the cumulative traffic history table.
+#[derive(Clone)]
+struct HistoryEntry {
+    pid:        u32,
+    name:       String,
+    remote_addr: String,
+    remote_port: u16,
+    rx_total:   u64,
+    tx_total:   u64,
+    rx_delta:   u64,  // from last tick
+    tx_delta:   u64,
+    connections: usize,
+    cpu_pct:    f32,
+    mem_bytes:  u64,
+    cmdline:    String,
+    last_seen:  std::time::Instant,
+}
+
+
 struct App {
     snap: Snapshot,
     filtered: Vec<Connection>,
@@ -141,6 +161,9 @@ struct App {
     pid_filter: Option<u32>,
     port_filter: Option<u16>,
     listen_only: bool,
+    /// Cumulative per-(pid, remote_addr, port) history — grows monotonically.
+    /// Key: (pid, remote_addr, remote_port). Never shrinks during a session.
+    proc_history: HashMap<(u32, String, u16), HistoryEntry>,
 }
 
 impl App {
@@ -168,6 +191,73 @@ impl App {
             pid_filter,
             port_filter,
             listen_only,
+            proc_history: HashMap::new(),
+        }
+    }
+
+    /// Merge the current snapshot's eBPF ip_traffic into the persistent history.
+    fn merge_history(&mut self) {
+        let now = std::time::Instant::now();
+        // Update / insert from live snapshot ip_traffic entries.
+        for p in &self.snap.procs {
+            for ip in &p.ip_traffic {
+                let key = (p.pid, ip.remote_addr.clone(), ip.remote_port);
+                let e = self.proc_history.entry(key).or_insert_with(|| HistoryEntry {
+                    pid:         p.pid,
+                    name:        p.name.clone(),
+                    remote_addr: ip.remote_addr.clone(),
+                    remote_port: ip.remote_port,
+                    rx_total:    0,
+                    tx_total:    0,
+                    rx_delta:    0,
+                    tx_delta:    0,
+                    connections: p.connections,
+                    cpu_pct:     p.cpu_pct,
+                    mem_bytes:   p.mem_bytes,
+                    cmdline:     p.cmdline.clone(),
+                    last_seen:   now,
+                });
+                // Always take the max to avoid going backward on totals.
+                e.rx_total   = e.rx_total.max(ip.rx_bytes_total);
+                e.tx_total   = e.tx_total.max(ip.tx_bytes_total);
+                e.rx_delta   = ip.rx_bytes_delta;
+                e.tx_delta   = ip.tx_bytes_delta;
+                e.connections = p.connections;
+                e.cpu_pct    = p.cpu_pct;
+                e.mem_bytes  = p.mem_bytes;
+                if !p.name.is_empty() { e.name = p.name.clone(); }
+                if !p.cmdline.is_empty() { e.cmdline = p.cmdline.clone(); }
+                e.last_seen  = now;
+            }
+            // If eBPF is not active, fall back to per-process totals with no remote breakdown.
+            if p.ip_traffic.is_empty() {
+                let key = (p.pid, String::new(), 0u16);
+                let e = self.proc_history.entry(key).or_insert_with(|| HistoryEntry {
+                    pid:         p.pid,
+                    name:        p.name.clone(),
+                    remote_addr: String::new(),
+                    remote_port: 0,
+                    rx_total:    0,
+                    tx_total:    0,
+                    rx_delta:    0,
+                    tx_delta:    0,
+                    connections: p.connections,
+                    cpu_pct:     p.cpu_pct,
+                    mem_bytes:   p.mem_bytes,
+                    cmdline:     p.cmdline.clone(),
+                    last_seen:   now,
+                });
+                e.rx_total   = e.rx_total.max(p.rx_bytes);
+                e.tx_total   = e.tx_total.max(p.tx_bytes);
+                e.rx_delta   = p.rx_bytes_delta;
+                e.tx_delta   = p.tx_bytes_delta;
+                e.connections = p.connections;
+                e.cpu_pct    = p.cpu_pct;
+                e.mem_bytes  = p.mem_bytes;
+                if !p.name.is_empty() { e.name = p.name.clone(); }
+                if !p.cmdline.is_empty() { e.cmdline = p.cmdline.clone(); }
+                e.last_seen  = now;
+            }
         }
     }
 
@@ -669,14 +759,13 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
         [
             "PID",
             "PROCESS",
-            "CONNS",
-            "CPU%",
-            "MEM",
+            "REMOTE ADDR",
+            "PORT",
             "RX/s",
             "TX/s",
             "RX TOTAL",
             "TX TOTAL",
-            "FULL CMDLINE",
+            "CMDLINE",
         ]
         .iter()
         .map(|h| {
@@ -690,63 +779,71 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
     .style(Style::default().bg(Color::DarkGray))
     .height(1);
 
-    let rows: Vec<Row> = app
-        .snap
-        .procs
+    // Build a sorted snapshot of history: most total traffic first.
+    let mut history: Vec<&HistoryEntry> = app.proc_history.values().collect();
+    history.sort_by(|a, b| {
+        (b.rx_total + b.tx_total).cmp(&(a.rx_total + a.tx_total))
+    });
+
+    let count = history.len();
+    let rows: Vec<Row> = history
         .iter()
-        .map(|p| {
-            let cc = if p.cpu_pct > 50.0 {
-                Color::Red
-            } else if p.cpu_pct > 10.0 {
-                Color::Yellow
+        .map(|e| {
+            let active = e.rx_delta + e.tx_delta > 0;
+            let name_style = if active {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
-                Color::Green
+                Style::default().fg(Color::DarkGray)
+            };
+            let remote = if e.remote_addr.is_empty() {
+                "-".to_string()
+            } else {
+                trunc(&e.remote_addr, 22)
+            };
+            let port_str = if e.remote_port == 0 {
+                "-".to_string()
+            } else {
+                e.remote_port.to_string()
             };
             Row::new(vec![
-                Cell::from(p.pid.to_string()).style(Style::default().fg(Color::Magenta)),
-                Cell::from(trunc(&p.name, 16)).style(
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(p.connections.to_string()).style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(format!("{:.1}%", p.cpu_pct)).style(Style::default().fg(cc)),
-                Cell::from(fmt_bytes(p.mem_bytes)).style(Style::default().fg(Color::Gray)),
-                Cell::from(fmt_rate(p.rx_bytes_delta))
-                    .style(Style::default().fg(rate_col(p.rx_bytes_delta))),
-                Cell::from(fmt_rate(p.tx_bytes_delta))
-                    .style(Style::default().fg(rate_col(p.tx_bytes_delta))),
-                Cell::from(fmt_bytes(p.rx_bytes)).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(fmt_bytes(p.tx_bytes)).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(trunc(&p.cmdline, 60)).style(Style::default().fg(Color::Gray)),
+                Cell::from(e.pid.to_string()).style(Style::default().fg(Color::Magenta)),
+                Cell::from(trunc(&e.name, 15)).style(name_style),
+                Cell::from(remote).style(Style::default().fg(Color::Cyan)),
+                Cell::from(port_str).style(Style::default().fg(Color::Cyan)),
+                Cell::from(fmt_rate(e.rx_delta))
+                    .style(Style::default().fg(rate_col(e.rx_delta))),
+                Cell::from(fmt_rate(e.tx_delta))
+                    .style(Style::default().fg(rate_col(e.tx_delta))),
+                Cell::from(fmt_bytes(e.rx_total)).style(Style::default().fg(Color::Green)),
+                Cell::from(fmt_bytes(e.tx_total)).style(Style::default().fg(Color::Yellow)),
+                Cell::from(trunc(&e.cmdline, 40)).style(Style::default().fg(Color::Gray)),
             ])
         })
         .collect();
 
+    let title = format!(
+        " Traffic History — {} connections (eBPF cumulative) ",
+        count
+    );
     let t = Table::new(
         rows,
         [
             Constraint::Length(7),
-            Constraint::Length(16),
+            Constraint::Length(15),
+            Constraint::Length(23),
             Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(9),
             Constraint::Length(11),
             Constraint::Length(11),
             Constraint::Length(10),
             Constraint::Length(10),
-            Constraint::Min(30),
+            Constraint::Min(20),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Processes with Network Activity (sorted by traffic) ")
+            .title(title)
             .border_style(Style::default().fg(Color::DarkGray)),
     )
     .highlight_style(
@@ -969,6 +1066,7 @@ pub fn run(
         listen_only,
     );
     app.snap = collector.collect();
+    app.merge_history();
     app.apply();
 
     loop {
@@ -1063,6 +1161,7 @@ pub fn run(
                     KeyCode::Char('r') => {
                         app.paused = false;
                         app.snap = collector.collect();
+                        app.merge_history();
                         app.apply();
                         app.last_tick = Instant::now();
                     }
@@ -1074,6 +1173,7 @@ pub fn run(
 
         if !app.paused && app.last_tick.elapsed() >= app.interval {
             app.snap = collector.collect();
+            app.merge_history();
             app.apply();
             app.last_tick = Instant::now();
         }
