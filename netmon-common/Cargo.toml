@@ -1,0 +1,13 @@
+[package]
+name    = "netmon-common"
+version = "0.1.0"
+edition = "2021"
+
+# This crate must compile both for the host (std) and for the eBPF target
+# (no_std, bpfel-unknown-none). Keep it dependency-free.
+[features]
+default = ["user"]
+user    = ["dep:aya"]  # enables std impls (Hash, Debug, …) on the host side
+
+[dependencies]
+aya = { version = "0.13", optional = true }

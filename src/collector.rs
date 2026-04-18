@@ -1,4 +1,7 @@
 //! Reads /proc/net/* and /proc/PID/* to build Snapshots.
+//! When the eBPF loader is active it merges per-(pid,ip) traffic data from
+//! the kernel probes into `ProcTraffic`, giving true per-IP byte accounting.
+use crate::ebpf_loader::EbpfTrafficTable;
 use crate::types::*;
 use procfs::net::TcpState;
 use std::collections::HashMap;
@@ -112,6 +115,8 @@ pub struct Collector {
     prev_iface: HashMap<String, (u64, u64)>,
     prev_proc_io: HashMap<u32, (u64, u64)>,
     uid_cache: HashMap<u32, Option<String>>,
+    /// Live eBPF traffic table — `None` when eBPF is unavailable.
+    pub ebpf_table: Option<EbpfTrafficTable>,
 }
 
 impl Collector {
@@ -124,6 +129,7 @@ impl Collector {
             prev_iface: HashMap::new(),
             prev_proc_io: HashMap::new(),
             uid_cache: HashMap::new(),
+            ebpf_table: None,
         }
     }
 
@@ -314,6 +320,7 @@ impl Collector {
                 connections: conn_count,
                 cpu_pct: proc.cpu_usage(),
                 mem_bytes: proc.memory(),
+                ip_traffic: vec![],   // filled in by eBPF merge below if active
             });
         }
         procs.sort_by(|a, b| {
@@ -325,6 +332,86 @@ impl Collector {
         let mut stats = GlobalStats::from_connections(&conns);
         stats.total_rx_bps = total_rx_bps;
         stats.total_tx_bps = total_tx_bps;
+
+        // ── Merge eBPF per-(pid,ip) data into ProcTraffic entries ───────────
+        // When the eBPF table is active we replace the /proc/PID/io-derived
+        // rx/tx deltas with the kernel-measured network-only byte counts.
+        // This gives true per-IP visibility without any packet copying.
+        if let Some(ref ebpf) = self.ebpf_table {
+            let ebpf_snap = ebpf.snapshot();
+
+            // Build a lookup: pid → list of (remote_addr, rx_delta, tx_delta).
+            let mut pid_ip_traffic: HashMap<u32, Vec<crate::types::IpTrafficEntry>> =
+                HashMap::new();
+
+            // Also aggregate total network bytes per PID for the process row.
+            let mut pid_net_rx: HashMap<u32, u64> = HashMap::new();
+            let mut pid_net_tx: HashMap<u32, u64> = HashMap::new();
+
+            for entry in &ebpf_snap {
+                pid_ip_traffic
+                    .entry(entry.pid)
+                    .or_default()
+                    .push(crate::types::IpTrafficEntry {
+                        remote_addr: entry.remote_addr.to_string(),
+                        remote_port: entry.remote_port,
+                        rx_bytes_total: entry.rx_bytes,
+                        tx_bytes_total: entry.tx_bytes,
+                        rx_bytes_delta: entry.rx_delta,
+                        tx_bytes_delta: entry.tx_delta,
+                    });
+                *pid_net_rx.entry(entry.pid).or_insert(0) += entry.rx_delta;
+                *pid_net_tx.entry(entry.pid).or_insert(0) += entry.tx_delta;
+            }
+
+            for proc in &mut procs {
+                // Override /proc/io deltas with kernel-measured network bytes.
+                if let Some(net_rx) = pid_net_rx.get(&proc.pid) {
+                    proc.rx_bytes_delta = *net_rx;
+                }
+                if let Some(net_tx) = pid_net_tx.get(&proc.pid) {
+                    proc.tx_bytes_delta = *net_tx;
+                }
+                // Attach the per-IP breakdown.
+                if let Some(ip_entries) = pid_ip_traffic.remove(&proc.pid) {
+                    proc.ip_traffic = ip_entries;
+                }
+            }
+
+            // Any PIDs tracked by eBPF but not yet in procs (e.g. short-lived
+            // processes) get a synthetic entry so they appear in the output.
+            for entry in &ebpf_snap {
+                if !procs.iter().any(|p| p.pid == entry.pid) && entry.pid != 0 {
+                    let net_rx = pid_net_rx.get(&entry.pid).cloned().unwrap_or(0);
+                    let net_tx = pid_net_tx.get(&entry.pid).cloned().unwrap_or(0);
+                    if net_rx + net_tx == 0 {
+                        continue;
+                    }
+                    procs.push(ProcTraffic {
+                        pid: entry.pid,
+                        name: entry.comm.clone(),
+                        cmdline: entry.comm.clone(),
+                        rx_bytes: entry.rx_bytes,
+                        tx_bytes: entry.tx_bytes,
+                        rx_bytes_delta: net_rx,
+                        tx_bytes_delta: net_tx,
+                        connections: *pid_conn_count.get(&entry.pid).unwrap_or(&0),
+                        cpu_pct: 0.0,
+                        mem_bytes: 0,
+                        ip_traffic: pid_ip_traffic
+                            .remove(&entry.pid)
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+
+            // Re-sort after merge.
+            procs.sort_by(|a, b| {
+                (b.rx_bytes_delta + b.tx_bytes_delta)
+                    .cmp(&(a.rx_bytes_delta + a.tx_bytes_delta))
+                    .then(b.connections.cmp(&a.connections))
+            });
+        }
 
         Snapshot {
             timestamp: chrono::Local::now(),

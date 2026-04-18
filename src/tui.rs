@@ -1,5 +1,4 @@
 //! Interactive TUI mode (ratatui + crossterm).
-use crate::collector::Collector;
 use crate::types::*;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -949,13 +948,20 @@ pub fn run(
     pid_filter: Option<u32>,
     port_filter: Option<u16>,
     listen_only: bool,
+    use_ebpf: bool,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut collector = Collector::new();
+    let mut collector = {
+        let mut c = crate::collector::Collector::new();
+        if use_ebpf {
+            c.ebpf_table = crate::ebpf_loader::start(std::time::Duration::from_millis(interval_ms));
+        }
+        c
+    };
     let mut app = App::new(
         Duration::from_millis(interval_ms),
         pid_filter,

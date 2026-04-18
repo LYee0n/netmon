@@ -63,6 +63,23 @@ pub struct ProcTraffic {
     pub connections: usize,
     pub cpu_pct: f32,
     pub mem_bytes: u64,
+    /// Per-(remote_ip, port) breakdown — populated when eBPF is active.
+    #[serde(default)]
+    pub ip_traffic: Vec<IpTrafficEntry>,
+}
+
+/// One row in the per-process IP breakdown table (eBPF mode only).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IpTrafficEntry {
+    /// Remote IP address as a string (IPv4 or IPv6).
+    pub remote_addr: String,
+    pub remote_port: u16,
+    /// Cumulative bytes since netmon started.
+    pub rx_bytes_total: u64,
+    pub tx_bytes_total: u64,
+    /// Bytes in the last collection interval.
+    pub rx_bytes_delta: u64,
+    pub tx_bytes_delta: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

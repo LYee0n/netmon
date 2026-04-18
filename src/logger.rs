@@ -335,3 +335,100 @@ fn hostname() -> String {
         .trim()
         .to_string()
 }
+
+/// Same as `run` but accepts a pre-configured `Collector` (e.g. with eBPF table attached).
+pub fn run_with_collector(
+    output_path: &str,
+    interval_ms: u64,
+    running: Arc<AtomicBool>,
+    mut collector: Collector,
+) -> Result<()> {
+    let interval = Duration::from_millis(interval_ms);
+    let interval_s = interval_ms as f64 / 1000.0;
+
+    eprintln!(
+        "netmon log-mode  →  '{output_path}'  │  interval={interval_s:.1}s  │  Ctrl-C to stop"
+    );
+
+    let mut sample = 0u64;
+
+    {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output_path)?;
+        let mut bw = BufWriter::new(file);
+        writeln!(bw, "# netmon monitoring log")?;
+        writeln!(
+            bw,
+            "# started  : {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S %Z")
+        )?;
+        writeln!(bw, "# output   : {output_path}")?;
+        writeln!(bw, "# interval : {interval_s:.1}s")?;
+        writeln!(bw, "# ebpf     : {}", if collector.ebpf_table.is_some() { "yes" } else { "no" })?;
+        writeln!(bw, "# host     : {}", hostname())?;
+        bw.flush()?;
+    }
+
+    while running.load(Ordering::SeqCst) {
+        sample += 1;
+        let snap = collector.collect();
+
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(output_path)?;
+            let mut bw = BufWriter::new(file);
+            write_report(&mut bw, &snap, sample, interval_s)?;
+
+            // If eBPF is active, append a per-process IP breakdown table.
+            if snap.procs.iter().any(|p| !p.ip_traffic.is_empty()) {
+                writeln!(bw, "\n  ── eBPF per-process IP traffic ──")?;
+                for proc in &snap.procs {
+                    if proc.ip_traffic.is_empty() {
+                        continue;
+                    }
+                    writeln!(
+                        bw,
+                        "  pid={:<6} {}",
+                        proc.pid, proc.name
+                    )?;
+                    for ip in &proc.ip_traffic {
+                        writeln!(
+                            bw,
+                            "    {:>42}:{:<5}  rx/s={:>10}  tx/s={:>10}  total_rx={:>12}  total_tx={:>12}",
+                            ip.remote_addr,
+                            ip.remote_port,
+                            fb(ip.rx_bytes_delta),
+                            fb(ip.tx_bytes_delta),
+                            fb(ip.rx_bytes_total),
+                            fb(ip.tx_bytes_total),
+                        )?;
+                    }
+                }
+                writeln!(bw)?;
+            }
+        }
+
+        eprintln!(
+            "[#{sample:>4}] conns:{:>5}  procs:{:>4}  rx:{:>14}  tx:{:>14}",
+            snap.stats.total,
+            snap.procs.len(),
+            fr(snap.stats.total_rx_bps),
+            fr(snap.stats.total_tx_bps)
+        );
+
+        let ticks = (interval.as_millis() / 100).max(1) as u64;
+        for _ in 0..ticks {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    eprintln!("\nnetmon: stopped after {sample} samples. Log → '{output_path}'");
+    Ok(())
+}

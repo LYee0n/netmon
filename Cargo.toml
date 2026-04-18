@@ -1,3 +1,13 @@
+[workspace]
+members  = [".", "netmon-common", "xtask"]
+resolver = "2"
+
+# netmon-ebpf targets bpfel-unknown-none (no_std, BPF only) and cannot be
+# parsed/compiled by a normal `cargo build`.  It lives outside the workspace
+# member list and is built exclusively via `cargo xtask build-ebpf` which
+# invokes cargo with the correct target and -Z build-std=core.
+exclude  = ["netmon-ebpf"]
+
 [package]
 name = "netmon"
 version = "0.2.0"
@@ -20,8 +30,17 @@ serde      = { version = "1", features = ["derive"] }
 anyhow     = "1"
 clap       = { version = "4", features = ["derive"] }
 libc       = "0.2"
+# eBPF userspace loader — sync threading, no tokio needed
+aya        = "0.13"
+aya-log    = "0.2"
+log        = "0.4"
+# Shared map types between host and eBPF crate
+netmon-common = { path = "netmon-common" }
 
 [profile.release]
 opt-level = 3
 strip     = true
 lto       = true
+
+[profile.dev]
+opt-level = 1  # faster iteration; eBPF side has its own profile

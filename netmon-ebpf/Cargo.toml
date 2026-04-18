@@ -1,0 +1,30 @@
+[package]
+name    = "netmon-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+# This crate is compiled for the BPF target, never the host.
+# Build it with: cargo xtask build-ebpf
+# or manually:   cargo build -p netmon-ebpf --target bpfel-unknown-none -Z build-std=core
+
+[dependencies]
+aya-ebpf       = "0.1"
+aya-log-ebpf   = "0.1"
+netmon-common  = { path = "../netmon-common", default-features = false }
+
+# aya-ebpf programs are compiled as binaries targeting bpfel-unknown-none.
+# Cargo will look for src/main.rs (which we have).
+[[bin]]
+name = "netmon-ebpf"
+path = "src/main.rs"
+
+# Optimise for size — BPF stack is 512 bytes, every byte counts.
+[profile.release]
+opt-level = "z"
+lto       = true
+panic     = "abort"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 2
+panic     = "abort"

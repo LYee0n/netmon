@@ -308,7 +308,8 @@ pub fn render(snap: &Snapshot, scrapes: u64) -> String {
     // This lets Prometheus/Grafana correlate IP addresses with owning PIDs.
     {
         // (pid, name, local_ip, remote_ip, proto) → count
-        let mut ip_pid_map: HashMap<(u32, String, String, String, String), usize> = HashMap::new();
+        let mut ip_pid_map: HashMap<(u32, String, String, String, String), usize> =
+            HashMap::new();
         for c in &snap.connections {
             if let (Some(pid), Some(pname)) = (c.pid, c.process_name.as_deref()) {
                 let key = (
@@ -329,13 +330,7 @@ pub fn render(snap: &Snapshot, scrapes: u64) -> String {
         );
         let mut entries: Vec<_> = ip_pid_map.iter().collect();
         entries.sort_by_key(|((pid, name, lip, rip, proto), _)| {
-            (
-                pid,
-                name.as_str(),
-                lip.as_str(),
-                rip.as_str(),
-                proto.as_str(),
-            )
+            (pid, name.as_str(), lip.as_str(), rip.as_str(), proto.as_str())
         });
         for ((pid, name, local_ip, remote_ip, proto), count) in entries {
             let lbl = format!(
@@ -557,4 +552,187 @@ pub fn run(port: u16, interval_ms: u64, running: Arc<AtomicBool>) -> Result<()> 
     }
     eprintln!("netmon: prometheus exporter stopped.");
     Ok(())
+}
+
+/// Same as `run` but accepts a pre-configured `Collector` (e.g. with eBPF table attached).
+/// Also emits additional `netmon_process_ebpf_*` metrics when eBPF is active.
+pub fn run_with_collector(
+    port: u16,
+    interval_ms: u64,
+    running: Arc<AtomicBool>,
+    collector: Collector,
+) -> Result<()> {
+    let addr = format!("0.0.0.0:{port}");
+    let listener = TcpListener::bind(&addr)?;
+    listener.set_nonblocking(true)?;
+
+    let ebpf_active = collector.ebpf_table.is_some();
+    eprintln!("netmon prometheus-mode");
+    eprintln!("  HTTP:     http://{addr}");
+    eprintln!("  Metrics:  http://localhost:{port}/metrics");
+    eprintln!("  Health:   http://localhost:{port}/health");
+    eprintln!("  eBPF:     {}", if ebpf_active { "active" } else { "off" });
+    eprintln!(
+        "  Interval: {:.1}s  │  Ctrl-C to stop",
+        interval_ms as f64 / 1000.0
+    );
+
+    let snap = Arc::new(Mutex::new(Snapshot::empty()));
+    let scrapes = Arc::new(AtomicU64::new(0));
+
+    // ── collector thread ──
+    {
+        let snap_w = snap.clone();
+        let run_c = running.clone();
+        let interval = Duration::from_millis(interval_ms);
+        let mut col = collector;
+        std::thread::spawn(move || {
+            while run_c.load(Ordering::SeqCst) {
+                let s = col.collect();
+                eprintln!(
+                    "  [collect] conns:{} procs:{} rx:{:.1}KB/s tx:{:.1}KB/s ebpf_entries:{}",
+                    s.stats.total,
+                    s.procs.len(),
+                    s.stats.total_rx_bps as f64 / 1024.0,
+                    s.stats.total_tx_bps as f64 / 1024.0,
+                    s.procs.iter().map(|p| p.ip_traffic.len()).sum::<usize>(),
+                );
+                if let Ok(mut g) = snap_w.lock() {
+                    *g = s;
+                }
+                let ticks = (interval.as_millis() / 100).max(1) as u64;
+                for _ in 0..ticks {
+                    if !run_c.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+    }
+
+    // ── accept loop ──
+    while running.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, addr)) => {
+                let snap_r = snap.clone();
+                let sc = scrapes.clone();
+                let port_c = port;
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    match read_path(&mut stream).as_deref() {
+                        Some(p) if p == "/metrics" || p.starts_with("/metrics?") => {
+                            let n = sc.fetch_add(1, Ordering::Relaxed) + 1;
+                            let snap_guard = snap_r.lock().unwrap();
+                            let mut body = render(&snap_guard, n);
+                            // Append eBPF per-IP metrics if available.
+                            body.push_str(&render_ebpf_ip_metrics(&snap_guard));
+                            drop(snap_guard);
+                            eprintln!("  [scrape #{n}] {addr} → /metrics ({} bytes)", body.len());
+                            respond(
+                                &mut stream,
+                                "200 OK",
+                                "text/plain; version=0.0.4; charset=utf-8",
+                                &body,
+                            );
+                        }
+                        Some("/health") => {
+                            respond(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                "{\"status\":\"ok\"}",
+                            );
+                        }
+                        Some("/") | Some("/index.html") => {
+                            respond(
+                                &mut stream,
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                &index_html(port_c),
+                            );
+                        }
+                        _ => {
+                            respond(
+                                &mut stream,
+                                "404 Not Found",
+                                "text/plain",
+                                "404 Not Found\nEndpoints: /metrics  /health  /\n",
+                            );
+                        }
+                    }
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => eprintln!("accept: {e}"),
+        }
+    }
+    eprintln!("netmon: prometheus exporter stopped.");
+    Ok(())
+}
+
+// ─── eBPF-specific Prometheus metrics ────────────────────────────────────────
+
+/// Renders additional metric families populated from eBPF per-IP data.
+/// Only emits output when at least one process has ip_traffic entries.
+fn render_ebpf_ip_metrics(snap: &Snapshot) -> String {
+    let has_ip = snap.procs.iter().any(|p| !p.ip_traffic.is_empty());
+    if !has_ip {
+        return String::new();
+    }
+
+    let mut o = String::with_capacity(4096);
+
+    // ── netmon_ebpf_ip_rx_bytes_total ──
+    o.push_str("# HELP netmon_ebpf_ip_rx_bytes_total Cumulative bytes received per process per remote IP (eBPF)\n");
+    o.push_str("# TYPE netmon_ebpf_ip_rx_bytes_total counter\n");
+    for p in &snap.procs {
+        for ip in &p.ip_traffic {
+            o.push_str(&format!(
+                "netmon_ebpf_ip_rx_bytes_total{{pid=\"{}\",process=\"{}\",remote_ip=\"{}\",remote_port=\"{}\"}} {}\n",
+                p.pid, esc(&p.name), esc(&ip.remote_addr), ip.remote_port, ip.rx_bytes_total
+            ));
+        }
+    }
+
+    // ── netmon_ebpf_ip_tx_bytes_total ──
+    o.push_str("# HELP netmon_ebpf_ip_tx_bytes_total Cumulative bytes transmitted per process per remote IP (eBPF)\n");
+    o.push_str("# TYPE netmon_ebpf_ip_tx_bytes_total counter\n");
+    for p in &snap.procs {
+        for ip in &p.ip_traffic {
+            o.push_str(&format!(
+                "netmon_ebpf_ip_tx_bytes_total{{pid=\"{}\",process=\"{}\",remote_ip=\"{}\",remote_port=\"{}\"}} {}\n",
+                p.pid, esc(&p.name), esc(&ip.remote_addr), ip.remote_port, ip.tx_bytes_total
+            ));
+        }
+    }
+
+    // ── netmon_ebpf_ip_rx_bytes_per_second ──
+    o.push_str("# HELP netmon_ebpf_ip_rx_bytes_per_second RX rate per process per remote IP in the last interval (eBPF)\n");
+    o.push_str("# TYPE netmon_ebpf_ip_rx_bytes_per_second gauge\n");
+    for p in &snap.procs {
+        for ip in &p.ip_traffic {
+            o.push_str(&format!(
+                "netmon_ebpf_ip_rx_bytes_per_second{{pid=\"{}\",process=\"{}\",remote_ip=\"{}\",remote_port=\"{}\"}} {}\n",
+                p.pid, esc(&p.name), esc(&ip.remote_addr), ip.remote_port, ip.rx_bytes_delta
+            ));
+        }
+    }
+
+    // ── netmon_ebpf_ip_tx_bytes_per_second ──
+    o.push_str("# HELP netmon_ebpf_ip_tx_bytes_per_second TX rate per process per remote IP in the last interval (eBPF)\n");
+    o.push_str("# TYPE netmon_ebpf_ip_tx_bytes_per_second gauge\n");
+    for p in &snap.procs {
+        for ip in &p.ip_traffic {
+            o.push_str(&format!(
+                "netmon_ebpf_ip_tx_bytes_per_second{{pid=\"{}\",process=\"{}\",remote_ip=\"{}\",remote_port=\"{}\"}} {}\n",
+                p.pid, esc(&p.name), esc(&ip.remote_addr), ip.remote_port, ip.tx_bytes_delta
+            ));
+        }
+    }
+
+    o
 }

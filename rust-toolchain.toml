@@ -1,0 +1,15 @@
+# rust-toolchain.toml
+#
+# Pins the Rust toolchain for this workspace.
+# Nightly is required to compile the eBPF crate with -Z build-std=core
+# (the bpfel-unknown-none target has no pre-built std).
+#
+# The host binary (netmon) compiles fine on stable; this file uses nightly
+# so both crates build in a single `cargo xtask build` invocation.
+# If you only want to build the host binary on stable, remove this file
+# and compile the eBPF crate separately with `cargo +nightly xtask build-ebpf`.
+
+[toolchain]
+channel  = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]
+targets  = ["bpfel-unknown-none"]
