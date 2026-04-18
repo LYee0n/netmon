@@ -85,6 +85,8 @@ struct TrafficTableInner {
     /// Last kernel-map value seen per key, used to detect eBPF-side resets.
     last_kernel_rx: HashMap<(u32, IpAddr, u16), u64>,
     last_kernel_tx: HashMap<(u32, IpAddr, u16), u64>,
+    /// Comm name cache — survives eviction so dead processes are still labelled.
+    comm_cache: HashMap<(u32, IpAddr, u16), String>,
 }
 
 impl EbpfTrafficTable {
@@ -120,8 +122,30 @@ impl EbpfTrafficTable {
             }
         }
 
+        // Emit synthetic entries for keys with lifetime bytes but no live entry
+        // (process finished and was evicted). These show cumulative totals only
+        // (delta = 0) so the user can see what a short-lived process transferred.
+        let lifetime_keys: Vec<_> = inner.lifetime_rx.keys().cloned().collect();
+        for k in lifetime_keys {
+            if inner.entries.contains_key(&k) {
+                continue; // already in out
+            }
+            let life_rx = *inner.lifetime_rx.get(&k).unwrap_or(&0);
+            let life_tx = *inner.lifetime_tx.get(&k).unwrap_or(&0);
+            if life_rx + life_tx == 0 {
+                continue;
+            }
+            let comm = inner.comm_cache.get(&k).cloned().unwrap_or_default();
+            let mut e = EbpfTrafficEntry::new(k.0, comm, k.1, k.2);
+            e.rx_bytes = life_rx;
+            e.tx_bytes = life_tx;
+            e.rx_delta = 0;
+            e.tx_delta = 0;
+            out.push(e);
+        }
+
         out.sort_by(|a, b| {
-            (b.rx_delta + b.tx_delta).cmp(&(a.rx_delta + a.tx_delta))
+            (b.rx_bytes + b.tx_bytes).cmp(&(a.rx_bytes + a.tx_bytes))
         });
         out
     }
@@ -142,13 +166,10 @@ impl EbpfTrafficTable {
         *inner.lifetime_rx.entry(mk).or_insert(0) += krx_inc;
         *inner.lifetime_tx.entry(mk).or_insert(0) += ktx_inc;
         // Now safe to mutably borrow entries.
+        let comm_str = val.comm_str().to_string();
+        inner.comm_cache.insert(mk, comm_str.clone());
         let entry = inner.entries.entry(mk).or_insert_with(|| {
-            EbpfTrafficEntry::new(
-                key.pid,
-                val.comm_str().to_string(),
-                remote_addr,
-                key.remote_port,
-            )
+            EbpfTrafficEntry::new(key.pid, comm_str, remote_addr, key.remote_port)
         });
         entry.rx_bytes  = val.rx_bytes;
         entry.tx_bytes  = val.tx_bytes;
@@ -172,8 +193,20 @@ impl EbpfTrafficTable {
         } else {
             *inner.lifetime_rx.entry(mk).or_insert(0) += inc;
         }
+        // Read comm eagerly before or_insert_with so we don't borrow inner
+        // inside the closure (which already mutably borrows inner.entries).
+        let is_new = !inner.entries.contains_key(&mk);
+        let comm = if is_new {
+            let c = std::fs::read_to_string(format!("/proc/{}/comm", ev.pid))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            inner.comm_cache.insert(mk, c.clone());
+            c
+        } else {
+            String::new() // unused — entry already exists
+        };
         let entry = inner.entries.entry(mk).or_insert_with(|| {
-            EbpfTrafficEntry::new(ev.pid, String::new(), remote_addr, ev.dst_port)
+            EbpfTrafficEntry::new(ev.pid, comm, remote_addr, ev.dst_port)
         });
         if ev.direction == 1 {
             entry.tx_bytes += inc;
